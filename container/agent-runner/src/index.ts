@@ -17,6 +17,7 @@
 import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import OpenAI from 'openai';
 import { fileURLToPath } from 'url';
 
 interface ContainerInput {
@@ -57,6 +58,7 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+type Provider = 'anthropic' | 'openai';
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -115,6 +117,14 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+function detectProvider(): Provider {
+  return process.env.NANOCLAW_PROVIDER === 'openai' ? 'openai' : 'anthropic';
+}
+
+function getOpenAIModel(): string {
+  return process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -464,6 +474,33 @@ async function runQuery(
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
+async function runOpenAIQuery(
+  prompt: string,
+  client: OpenAI,
+  messageHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+  systemPrompt?: string,
+): Promise<{ closedDuringQuery: boolean }> {
+  if (systemPrompt && messageHistory.length === 0) {
+    messageHistory.push({ role: 'system', content: systemPrompt });
+  }
+
+  messageHistory.push({ role: 'user', content: prompt });
+
+  const response = await client.chat.completions.create({
+    model: getOpenAIModel(),
+    messages: messageHistory,
+    temperature: 0.2,
+  });
+
+  const text = response.choices[0]?.message?.content || '';
+  if (text) {
+    messageHistory.push({ role: 'assistant', content: text });
+  }
+
+  writeOutput({ status: 'success', result: text || null });
+  return { closedDuringQuery: false };
+}
+
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
@@ -487,6 +524,16 @@ async function main(): Promise<void> {
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  const provider = detectProvider();
+  const openaiClient =
+    provider === 'openai'
+      ? new OpenAI({
+          apiKey: process.env.OPENAI_API_KEY || '',
+          baseURL: process.env.OPENAI_BASE_URL,
+        })
+      : null;
+  const openaiMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+    [];
 
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
@@ -505,30 +552,62 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
+  // OpenAI system prompt (if available)
+  let openaiSystemPrompt: string | undefined;
+  if (provider === 'openai') {
+    const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+    if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+      openaiSystemPrompt = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+    }
+  }
+
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
   try {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
-      }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
-      }
+      if (provider === 'openai') {
+        if (!openaiClient) {
+          throw new Error('OpenAI client not initialized');
+        }
+        const queryResult = await runOpenAIQuery(
+          prompt,
+          openaiClient,
+          openaiMessages,
+          openaiSystemPrompt,
+        );
+        if (queryResult.closedDuringQuery) {
+          log('Close sentinel consumed during query, exiting');
+          break;
+        }
+      } else {
+        const queryResult = await runQuery(
+          prompt,
+          sessionId,
+          mcpServerPath,
+          containerInput,
+          sdkEnv,
+          resumeAt,
+        );
+        if (queryResult.newSessionId) {
+          sessionId = queryResult.newSessionId;
+        }
+        if (queryResult.lastAssistantUuid) {
+          resumeAt = queryResult.lastAssistantUuid;
+        }
 
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
-      if (queryResult.closedDuringQuery) {
-        log('Close sentinel consumed during query, exiting');
-        break;
-      }
+        // If _close was consumed during the query, exit immediately.
+        // Don't emit a session-update marker (it would reset the host's
+        // idle timer and cause a 30-min delay before the next _close).
+        if (queryResult.closedDuringQuery) {
+          log('Close sentinel consumed during query, exiting');
+          break;
+        }
 
-      // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+        // Emit session update so host can track it
+        writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+      }
 
       log('Query ended, waiting for next IPC message...');
 

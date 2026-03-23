@@ -25,7 +25,8 @@ import {
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { detectAuthMode } from './credential-proxy.js';
+import { detectAuthMode, detectProvider } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -218,24 +219,41 @@ function buildContainerArgs(
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  const provider = detectProvider();
+  const openaiConfig = readEnvFile(['OPENAI_MODEL']);
+
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
+  args.push('-e', `NANOCLAW_PROVIDER=${provider}`);
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  if (provider === 'openai') {
+    // Route API traffic through the credential proxy (containers never see real secrets)
+    args.push(
+      '-e',
+      `OPENAI_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}/v1`,
+    );
+    args.push('-e', 'OPENAI_API_KEY=placeholder');
+    if (openaiConfig.OPENAI_MODEL) {
+      args.push('-e', `OPENAI_MODEL=${openaiConfig.OPENAI_MODEL}`);
+    }
   } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    // Route API traffic through the credential proxy (containers never see real secrets)
+    args.push(
+      '-e',
+      `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    );
+
+    // Mirror the host's auth method with a placeholder value.
+    // API key mode: SDK sends x-api-key, proxy replaces with real key.
+    // OAuth mode:   SDK exchanges placeholder token for temp API key,
+    //               proxy injects real OAuth token on that exchange request.
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
   }
 
   // Runtime-specific args for host gateway resolution
